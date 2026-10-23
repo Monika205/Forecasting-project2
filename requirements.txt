@@ -1,23 +1,6 @@
-# Frontend
-streamlit>=1.40.0
-requests>=2.32.0
 
-# Backend API
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
-
-# Data processing
-pandas>=2.2.0
-numpy>=1.26.0
-
-# Forecasting and evaluation
-scikit-learn>=1.5.0
-statsmodels>=0.14.0
-
-# Excel file support
-openpyxl>=3.1.0
-xlrd>=2.0.1
-
-# Charts
-matplotlib>=3.9.0
+streamlit
+pandas
+numpy
+plotly
+statsmodels
