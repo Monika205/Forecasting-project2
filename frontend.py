@@ -6,6 +6,15 @@ import plotly.graph_objects as go
 import streamlit as st
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
+
+
+
+# Backend API URL
+BACKEND_URL = "https://forecasting-project2-1.onrender.com"
+FORECAST_ENDPOINT = f"{BACKEND_URL.rstrip('/')}/forecast"
+HEALTH_ENDPOINT = f"{BACKEND_URL.rstrip('/')}/health"
+
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
