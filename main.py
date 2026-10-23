@@ -94,8 +94,6 @@ def forecast(request: ForecastRequest):
 
         if df["month"].isna().any() or df["demand"].isna().any():
             raise HTTPException(
-
-            raise HTTPException(
                 status_code=400,
                 detail="Use valid YYYY-MM months and numeric demand values.",
             )
