@@ -94,3 +94,192 @@ def forecast(request: ForecastRequest):
 
         if df["month"].isna().any() or df["demand"].isna().any():
             raise HTTPException(
+
+            raise HTTPException(
+                status_code=400,
+                detail="Use valid YYYY-MM months and numeric demand values.",
+            )
+
+        if not np.isfinite(df["demand"].to_numpy(dtype=float)).all():
+            raise HTTPException(
+                status_code=400,
+                detail="Demand values must be finite numbers.",
+            )
+
+        if (df["demand"] < 0).any():
+            raise HTTPException(
+                status_code=400,
+                detail="Demand cannot be negative.",
+            )
+
+        df["month"] = df["month"].dt.to_period("M").dt.to_timestamp()
+        df = df.sort_values("month").reset_index(drop=True)
+
+        if df["month"].duplicated().any():
+            raise HTTPException(
+                status_code=400,
+                detail="Duplicate months found. Keep one row per month.",
+            )
+
+        expected = pd.date_range(
+            df["month"].min(),
+            df["month"].max(),
+            freq="MS",
+        )
+
+        if len(expected) != len(df) or not np.array_equal(
+            df["month"].to_numpy(), expected.to_numpy()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Months must be consecutive. Add missing months.",
+            )
+
+        series = pd.Series(
+            df["demand"].to_numpy(dtype=float),
+            index=expected,
+            name="Demand",
+        )
+
+        if request.history_months is not None:
+            series = series.iloc[
+                -min(request.history_months, len(series)):
+            :]
+
+        series.index.name = "Month"
+
+        candidate_names = [
+            "Naive baseline",
+            "Mean baseline",
+            "Drift",
+            "Holt damped trend",
+        ]
+
+        if len(series) >= 30:
+            candidate_names.append("Holt-Winters seasonal")
+
+        test_count = min(6, max(1, len(series) - 5))
+        first_test_index = len(series) - test_count
+        scores = []
+
+        for model_name in candidate_names:
+            actual_values = []
+            predicted_values = []
+
+            for test_index in range(first_test_index, len(series)):
+                training = series.iloc[:test_index]
+                actual = float(series.iloc[test_index])
+
+                try:
+                    prediction = float(
+                        fit_predict(model_name, training, 1)[0]
+                    )
+                    actual_values.append(actual)
+                    predicted_values.append(prediction)
+                except Exception:
+                    continue
+
+            if actual_values:
+                mae = float(
+                    mean_absolute_error(
+                        actual_values, predicted_values
+                    )
+                )
+                rmse = float(
+                    np.sqrt(
+                        mean_squared_error(
+                            actual_values, predicted_values
+                        )
+                    )
+                )
+
+                actual_array = np.asarray(actual_values, dtype=float)
+                predicted_array = np.asarray(predicted_values, dtype=float)
+                nonzero = actual_array != 0
+                mape = None
+
+                if nonzero.any():
+                    mape = float(
+                        np.mean(
+                            np.abs(
+                                (
+                                    actual_array[nonzero]
+                                    - predicted_array[nonzero]
+                                )
+                                / actual_array[nonzero]
+                            )
+                        ) * 100
+                    )
+
+                scores.append({
+                    "model": model_name,
+                    "MAE": round(mae, 2),
+                    "RMSE": round(rmse, 2),
+                    "MAPE": round(mape, 2) if mape is not None else None,
+                    "test_points": len(actual_values),
+                })
+
+        if not scores:
+            raise HTTPException(
+                status_code=400,
+                detail="Not enough valid history to compare forecasting models.",
+            )
+
+        scores.sort(key=lambda row: (row["MAE"], row["RMSE"]))
+        best_model = scores[0]["model"]
+
+        predictions = fit_predict(
+            best_model,
+            series,
+            int(request.months),
+        )
+
+        future_dates = pd.date_range(
+            start=series.index[-1] + pd.offsets.MonthBegin(1),
+            periods=int(request.months),
+            freq="MS",
+        )
+
+        forecast_rows = [
+            {
+                "month": date.strftime("%Y-%m"),
+                "forecast": round(float(value), 2),
+            }
+            for date, value in zip(future_dates, predictions)
+        ]
+
+        return {
+            "summary": {
+                "months": int(len(series)),
+                "total_quantity": round(float(series.sum()), 2),
+                "average_demand": round(float(series.mean()), 2),
+                "selected_model": best_model,
+                "history_months_used": int(len(series)),
+                "total_forecast_demand": round(
+                    float(np.sum(predictions)), 2
+                ),
+                "average_monthly_forecast": round(
+                    float(np.mean(predictions)), 2
+                ),
+                "validation_method": "rolling one-month-ahead backtest",
+            },
+            "best_model": best_model,
+            "model_scores": scores,
+            "history": [
+                {
+                    "month": date.strftime("%Y-%m"),
+                    "quantity": round(float(value), 2),
+                }
+                for date, value in series.items()
+            ],
+            "forecast": forecast_rows,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not generate forecast: {str(exc)}",
+        )
