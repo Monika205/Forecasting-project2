@@ -1,96 +1,124 @@
-import pandas as pd
-import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from statsmodels.tsa.holtwinters import (
-    SimpleExpSmoothing, Holt, ExponentialSmoothing
-)
+    return {"status": "ok"}
 
 
-def prepare_monthly_data(df):
-    columns = {str(c).strip().lower(): c for c in df.columns}
+@app.post("/forecast")
+def forecast(request: ForecastRequest):
+    try:
+        if len(request.data) < 6:
+            raise HTTPException(status_code=400, detail="At least 6 months of data required.")
 
-    date_col = next(
-        (columns[c] for c in ["orderdate", "order date", "date"] if c in columns),
-        None
-    )
-    qty_col = next(
-        (columns[c] for c in ["quantity", "qty", "demand", "sales"] if c in columns),
-        None
-    )
+        df = pd.DataFrame([row.model_dump() for row in request.data])
+        df["month"] = pd.to_datetime(df["month"], format="%Y-%m", errors="coerce")
+        df["demand"] = pd.to_numeric(df["demand"], errors="coerce")
 
-    if date_col is None or qty_col is None:
-        raise ValueError("Date aur Quantity columns required hain.")
+        if df["month"].isna().any() or df["demand"].isna().any():
+            raise HTTPException(status_code=400, detail="Each row needs a valid YYYY-MM month and numeric demand.")
+        if (df["demand"] < 0).any():
+            raise HTTPException(status_code=400, detail="Demand cannot be negative.")
 
-    data = df[[date_col, qty_col]].copy()
-    data.columns = ["OrderDate", "Quantity"]
-    data["OrderDate"] = pd.to_datetime(data["OrderDate"], errors="coerce")
-    data["Quantity"] = pd.to_numeric(data["Quantity"], errors="coerce")
-    data = data.dropna()
+        df["month"] = df["month"].dt.to_period("M").dt.to_timestamp()
+        df = df.sort_values("month")
+        if df["month"].duplicated().any():
+            raise HTTPException(status_code=400, detail="Duplicate months found. Keep one row per month.")
 
-    if data.empty:
-        raise ValueError("Dataset mein valid date/quantity data nahi hai.")
+        expected = pd.date_range(df["month"].min(), df["month"].max(), freq="MS")
+        if len(expected) != len(df) or not df["month"].reset_index(drop=True).equals(pd.Series(expected, name="month")):
+            raise HTTPException(status_code=400, detail="Months must be consecutive. Add any missing months.")
 
-    monthly = (
-        data.set_index("OrderDate")["Quantity"]
-        .resample("MS").sum()
-        .asfreq("MS", fill_value=0)
-    )
+        monthly = pd.Series(df["demand"].to_numpy(float), index=expected, name="Demand")
+        monthly.index.name = "Month"
 
-    if len(monthly) < 3:
-        raise ValueError("Kam se kam 3 months ka data chahiye.")
+        test_size = min(3, max(1, len(monthly) // 5))
+        train, test = monthly.iloc[:-test_size], monthly.iloc[-test_size:]
+        scores = []
 
-    return monthly
+        naive_pred = np.repeat(float(train.iloc[-1]), len(test))
+        scores.append({
+            "model": "Naive baseline",
+            "MAE": round(float(mean_absolute_error(test, naive_pred)), 2),
+            "RMSE": round(float(np.sqrt(mean_squared_error(test, naive_pred))), 2),
+        })
 
-
-def compare_models(monthly):
-    test_size = min(12, max(1, len(monthly) // 4))
-    train = monthly.iloc[:-test_size]
-    test = monthly.iloc[-test_size:]
-    results = []
-
-    models = {
-        "Simple Exponential Smoothing": lambda: SimpleExpSmoothing(
-            train, initialization_method="estimated"
-        ).fit().forecast(len(test)),
-        "Holt Trend": lambda: Holt(
-            train, initialization_method="estimated"
-        ).fit(optimized=True).forecast(len(test))
-    }
-
-    if len(train) >= 24:
-        models["Holt-Winters Seasonal"] = lambda: ExponentialSmoothing(
-            train, trend="add", seasonal="add",
-            seasonal_periods=12, initialization_method="estimated"
-        ).fit(optimized=True).forecast(len(test))
-
-    for name, predict in models.items():
+        candidates = {}
         try:
-            pred = np.asarray(predict())
-            results.append({
-                "Model": name,
-                "MAE": mean_absolute_error(test, pred),
-                "RMSE": np.sqrt(mean_squared_error(test, pred))
-            })
+            candidates["Holt Trend"] = lambda series, steps: Holt(
+                series, initialization_method="estimated"
+            ).fit().forecast(steps)
         except Exception:
             pass
 
-    return pd.DataFrame(results).sort_values("MAE") if results else pd.DataFrame()
+        if len(train) >= 6:
+            try:
+                candidates["Holt Trend"] = lambda series, steps: Holt(
+                    series, initialization_method="estimated"
+                ).fit().forecast(steps)
+                pred = np.asarray(candidates["Holt Trend"](train, len(test)), dtype=float)
+                scores.append({
+                    "model": "Holt Trend",
+                    "MAE": round(float(mean_absolute_error(test, pred)), 2),
+                    "RMSE": round(float(np.sqrt(mean_squared_error(test, pred))), 2),
+                })
+            except Exception:
+                pass
 
+        if len(train) >= 24:
+            try:
+                pred = ExponentialSmoothing(
+                    train, trend="add", seasonal="add", seasonal_periods=12,
+                    initialization_method="estimated"
+                ).fit().forecast(len(test)).to_numpy()
+                scores.append({
+                    "model": "Holt-Winters Seasonal",
+                    "MAE": round(float(mean_absolute_error(test, pred)), 2),
+                    "RMSE": round(float(np.sqrt(mean_squared_error(test, pred))), 2),
+                })
+            except Exception:
+                pass
 
-def make_forecast(monthly, periods=3, model_name=None):
-    if model_name == "Holt-Winters Seasonal" and len(monthly) >= 24:
-        model = ExponentialSmoothing(
-            monthly, trend="add", seasonal="add",
-            seasonal_periods=12, initialization_method="estimated"
-        ).fit(optimized=True)
-    elif model_name == "Holt Trend":
-        model = Holt(
-            monthly, initialization_method="estimated"
-        ).fit(optimized=True)
-    else:
-        model = SimpleExpSmoothing(
-            monthly, initialization_method="estimated"
-        ).fit()
+        scores.sort(key=lambda row: row["MAE"])
+        best = scores[0]["model"]
 
-    forecast = model.forecast(periods).clip(lower=0)
-    return forecast
+        if best == "Holt-Winters Seasonal" and len(monthly) >= 24:
+            fitted = ExponentialSmoothing(
+                monthly, trend="add", seasonal="add", seasonal_periods=12,
+                initialization_method="estimated"
+            ).fit()
+            predictions = fitted.forecast(request.months)
+        elif best == "Holt Trend":
+            predictions = Holt(monthly, initialization_method="estimated").fit().forecast(request.months)
+        else:
+            predictions = SimpleExpSmoothing(monthly, initialization_method="estimated").fit().forecast(request.months)
+
+        predictions = np.maximum(np.asarray(predictions, dtype=float), 0)
+        future_dates = pd.date_range(
+            monthly.index[-1] + pd.offsets.MonthBegin(1),
+            periods=request.months,
+            freq="MS",
+        )
+
+        forecast_rows = [
+            {"month": date.strftime("%Y-%m"), "forecast": round(float(value), 2)}
+            for date, value in zip(future_dates, predictions)
+        ]
+
+        return {
+            "summary": {
+                "months": int(len(monthly)),
+                "total_quantity": float(monthly.sum()),
+                "average_demand": round(float(monthly.mean()), 2),
+                "selected_model": best,
+                "total_forecast_demand": round(float(np.sum(predictions)), 2),
+                "average_monthly_forecast": round(float(np.mean(predictions)), 2),
+            },
+            "best_model": best,
+            "model_scores": scores,
+            "history": [
+                {"month": date.strftime("%Y-%m"), "quantity": float(value)}
+                for date, value in monthly.items()
+            ],
+            "forecast": forecast_rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not generate forecast: {str(exc)}")
