@@ -1,7 +1,0 @@
-
-fastapi
-uvicorn
-pandas
-numpy
-statsmodels
-python-multipart
